@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Sedas Map Simple Fullscreen</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { margin:0; font-family:sans-serif; background:#181a1b; color:#eee; }
+        #container { display:flex; height:100vh; }
+        #sidebar {
+            width:340px; background:#23272a; padding:0; overflow-y:auto; border-right:1px solid #333;
+            display:flex; flex-direction:column; transition: width 0.2s; min-width:60px;
+        }
+        #sidebar.collapsed { width: 48px; min-width:48px; }
+        #sidebar.collapsed *:not(#sidebar-toggle) { display:none !important; }
+        #sidebar-toggle {
+            background:#181a1b; color:#eee; border:none; width:100%; padding:8px 0; cursor:pointer; font-size:1.2em; border-bottom:1px solid #333;
+        }
+        #clock { text-align:center; font-size:1.1em; margin:10px 0 0 0; letter-spacing:1px; }
+        #search { margin:12px; padding:8px; border-radius:4px; border:none; width:calc(100% - 24px); background:#181a1b; color:#eee; }
+        .table-responsive { width:100%; overflow-x:auto; }
+        table { width:100%; border-collapse:collapse; min-width:600px; }
+        th, td { padding:8px; border-bottom:1px solid #333; }
+        tr { cursor:pointer; }
+        tr.selected { background:#444; }
+        .collapse-btn { background:none; border:none; color:#eee; font-size:1em; cursor:pointer; }
+        .streets { display:none; background:#222; }
+        .streets.visible { display:table-row; }
+        .street-list { font-size:0.95em; color:#aaa; padding-left:24px; }
+        #map { flex:1; height:100vh; }
+        #floating-info {
+            display:none; position:fixed; z-index:9999; background:#23272aee; color:#eee; border-radius:8px; box-shadow:0 2px 8px #000a; padding:14px 18px; min-width:220px; pointer-events:none; font-size:1em;
+        }
+        .sort-btn, .filter-btn { background:none; border:none; color:#8fd; cursor:pointer; font-size:1em; margin-left:2px; }
+        .filter-dropdown { display:none; position:absolute; background:#23272a; color:#eee; border:1px solid #444; z-index:1000; max-height:200px; overflow-y:auto; min-width:120px; }
+        .filter-dropdown label { display:block; padding:4px 8px; cursor:pointer; }
+        .filter-dropdown label:hover { background:#333; }
+        .th-header { position:relative; white-space:nowrap; }
+        @media (max-width: 700px) {
+            #sidebar { width: 100vw; min-width: 0; }
+            table { min-width: 400px; font-size:0.95em; }
+        }
+        ::-webkit-scrollbar { width:8px; background:#222; }
+        ::-webkit-scrollbar-thumb { background:#444; }
+    </style>
+</head>
+<body>
+<div id="container">
+    <div id="sidebar">
+        <button id="sidebar-toggle">☰</button>
+        <div id="clock"></div>
+        <input id="search" type="text" placeholder="Search city, district, mahalle...">
+        <div class="table-responsive">
+        <table id="data-table">
+            <thead>
+                <tr>
+                    <th class="th-header">City <button class="sort-btn" data-col="ZIL">⇅</button> <button class="filter-btn" data-col="ZIL">⛃</button><div class="filter-dropdown" data-col="ZIL"></div></th>
+                    <th class="th-header">District <button class="sort-btn" data-col="ZILCE">⇅</button> <button class="filter-btn" data-col="ZILCE">⛃</button><div class="filter-dropdown" data-col="ZILCE"></div></th>
+                    <th class="th-header">Mahalle <button class="sort-btn" data-col="ZMAHALLE">⇅</button> <button class="filter-btn" data-col="ZMAHALLE">⛃</button><div class="filter-dropdown" data-col="ZMAHALLE"></div></th>
+                    <th class="th-header">Duration <button class="sort-btn" data-col="ZPLANTAR">⇅</button></th>
+                    <th class="th-header">Streets</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+        </div>
+        <button id="refresh-data" style="margin:8px 12px 0 12px;padding:7px 0;border-radius:4px;background:#181a1b;color:#8fd;border:1px solid #333;cursor:pointer;">⟳ Refresh Data</button>
+    </div>
+    <div id="map"></div>
+    <div id="floating-info"></div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const apiUrl = 'https://www.sedas.com/Home/MapDataJson/';
+let map, markers = [], data = [], selectedRow = null, filteredData = [], sortState = {}, filterState = {};
+
+function parseCoord(coordStr) {
+    if (!coordStr) return null;
+    let [lng, lat] = coordStr.split(';').map(s => s.trim().replace(',', '.'));
+    return [parseFloat(lat), parseFloat(lng)];
+}
+
+function normalize(str) {
+    // Replace Turkish chars, then lowercase, then remove non-alphanum
+    return (str||'')
+        .replace(/İ/g,'i').replace(/I/g,'i').replace(/Ş/g,'s').replace(/ş/g,'s')
+        .replace(/Ğ/g,'g').replace(/ğ/g,'g').replace(/Ü/g,'u').replace(/ü/g,'u')
+        .replace(/Ö/g,'o').replace(/ö/g,'o').replace(/Ç/g,'c').replace(/ç/g,'c')
+        .replace(/Â/g,'a').replace(/â/g,'a').replace(/Î/g,'i').replace(/î/g,'i').replace(/Û/g,'u').replace(/û/g,'u')
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function createTableRows(filtered) {
+    const tbody = document.querySelector('#data-table tbody');
+    tbody.innerHTML = '';
+    filtered.forEach((item, idx) => {
+        const duration = `${item.ZPLANTAR||''} ${item.ZBASSAAT||''} - ${item.ZBITSAAT||''}`;
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${item.ZIL}</td><td>${item.ZILCE}</td><td>${item.ZMAHALLE}</td><td>${duration}</td><td><button class="collapse-btn">+</button></td>`;
+        tr.dataset.idx = idx;
+        tbody.appendChild(tr);
+        // Collapsible row for streets
+        const trStreets = document.createElement('tr');
+        trStreets.className = 'streets';
+        trStreets.innerHTML = `<td colspan="5"><div class="street-list">${item.ZCSBM.replace(/ , /g, ', ').replace(/ ,$/, '')}</div></td>`;
+        tbody.appendChild(trStreets);
+    });
+}
+
+function updateMarkers(filtered) {
+    markers.forEach(m => map.removeLayer(m));
+    markers = [];
+    filtered.forEach((item, idx) => {
+        const coord = parseCoord(item.ZKOORDINAT);
+        if (coord && !isNaN(coord[0]) && !isNaN(coord[1])) {
+            const marker = L.marker(coord).addTo(map);
+            marker.idx = idx;
+            marker.on('click', () => selectRow(idx));
+            markers.push(marker);
+        }
+    });
+}
+
+function selectRow(idx) {
+    const tbody = document.querySelector('#data-table tbody');
+    Array.from(tbody.querySelectorAll('tr')).forEach(tr => tr.classList.remove('selected'));
+    const tr = tbody.querySelectorAll('tr')[idx*2];
+    tr.classList.add('selected');
+    // Show popup on map
+    const item = filteredData[idx];
+    const coord = parseCoord(item.ZKOORDINAT);
+    if (coord) {
+        map.setView(coord, 13);
+        markers[idx].bindPopup(`<b>${item.ZIL} / ${item.ZILCE} / ${item.ZMAHALLE}</b><br><div style='color:#aaa;font-size:0.95em;'>${item.ZCSBM.replace(/ , /g, ', ').replace(/ ,$/, '')}</div>`).openPopup();
+    }
+}
+
+function collapseHandler(e) {
+    e.stopPropagation();
+    const btn = e.target;
+    const tr = btn.closest('tr');
+    const next = tr.nextElementSibling;
+    if (next.classList.contains('visible')) {
+        next.classList.remove('visible');
+        btn.textContent = '+';
+    } else {
+        document.querySelectorAll('.streets.visible').forEach(row => {
+            row.classList.remove('visible');
+            row.previousElementSibling.querySelector('.collapse-btn').textContent = '+';
+        });
+        next.classList.add('visible');
+        btn.textContent = '-';
+    }
+}
+
+function filterTable() {
+    const val = normalize(document.getElementById('search').value.trim());
+    let filtered = data.filter(item => {
+        const fields = [item.ZIL, item.ZILCE, item.ZMAHALLE, item.ZCSBM].map(normalize);
+        console.log('search:', val, 'fields:', fields);
+        return fields.some(f => f.includes(val));
+    });
+    // Apply column filters
+    Object.keys(filterState).forEach(col => {
+        if (filterState[col] && filterState[col].length > 0) {
+            filtered = filtered.filter(item => filterState[col].includes(item[col]));
+        }
+    });
+    // Apply sorting
+    if (sortState.col) {
+        filtered = filtered.slice().sort((a, b) => {
+            let av = a[sortState.col]||'';
+            let bv = b[sortState.col]||'';
+            if (sortState.col === 'ZPLANTAR') {
+                av = (a.ZPLANTAR||'') + ' ' + (a.ZBASSAAT||'');
+                bv = (b.ZPLANTAR||'') + ' ' + (b.ZBASSAAT||'');
+            }
+            av = normalize(av); bv = normalize(bv);
+            if (av < bv) return sortState.dir === 'asc' ? -1 : 1;
+            if (av > bv) return sortState.dir === 'asc' ? 1 : -1;
+            return 0;
+        });
+    }
+    filteredData = filtered;
+    createTableRows(filteredData);
+    updateMarkers(filteredData);
+    addTableEvents();
+}
+
+function addTableEvents() {
+    const tbody = document.querySelector('#data-table tbody');
+    Array.from(tbody.querySelectorAll('tr')).forEach((tr, i) => {
+        if (i%2===0) {
+            tr.onclick = () => selectRow(i/2);
+            tr.querySelector('.collapse-btn').onclick = collapseHandler;
+            tr.onmouseenter = (e) => showFloatingInfo(filteredData[i/2], e);
+            tr.onmousemove = (e) => moveFloatingInfo(e);
+            tr.onmouseleave = hideFloatingInfo;
+        }
+    });
+}
+
+function showFloatingInfo(item, e) {
+    const info = document.getElementById('floating-info');
+    info.innerHTML = `<b>${item.ZIL} / ${item.ZILCE} / ${item.ZMAHALLE}</b><br>
+        <span style='color:#aaa;font-size:0.97em;'>${item.ZCSBM.replace(/ , /g, ', ').replace(/ ,$/, '')}</span><br>
+        <span style='color:#8fd; font-size:0.97em;'>${item.ZPLANTAR} ${item.ZBASSAAT} - ${item.ZBITSAAT}</span>`;
+    info.style.display = 'block';
+    moveFloatingInfo(e);
+}
+function moveFloatingInfo(e) {
+    const info = document.getElementById('floating-info');
+    info.style.left = (e.clientX + 18) + 'px';
+    info.style.top = (e.clientY + 12) + 'px';
+}
+function hideFloatingInfo() {
+    document.getElementById('floating-info').style.display = 'none';
+}
+
+// Sidebar collapse
+const sidebar = document.getElementById('sidebar');
+document.getElementById('sidebar-toggle').onclick = () => {
+    sidebar.classList.toggle('collapsed');
+};
+
+// Clock
+function updateClock() {
+    const now = new Date();
+    document.getElementById('clock').textContent = now.toLocaleTimeString();
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// Sorting and filtering
+function setupTableHeaderEvents() {
+    document.querySelectorAll('.sort-btn').forEach(btn => {
+        btn.onclick = (e) => {
+            const col = btn.dataset.col;
+            if (sortState.col === col) {
+                sortState.dir = sortState.dir === 'asc' ? 'desc' : 'asc';
+            } else {
+                sortState.col = col;
+                sortState.dir = 'asc';
+            }
+            filterTable();
+        };
+    });
+    document.querySelectorAll('.filter-btn').forEach(btn => {
+        btn.onclick = (e) => {
+            e.stopPropagation();
+            const col = btn.dataset.col;
+            const dropdown = btn.parentElement.querySelector('.filter-dropdown');
+            document.querySelectorAll('.filter-dropdown').forEach(d => { if (d!==dropdown) d.style.display='none'; });
+            if (dropdown.style.display === 'block') { dropdown.style.display = 'none'; return; }
+            // Fill dropdown
+            const values = Array.from(new Set(data.map(item => item[col]))).sort();
+            dropdown.innerHTML = values.map(val => `<label><input type="checkbox" value="${val}" ${filterState[col]&&filterState[col].includes(val)?'checked':''}> ${val}</label>`).join('');
+            dropdown.style.display = 'block';
+            dropdown.onmouseleave = () => dropdown.style.display = 'none';
+            dropdown.querySelectorAll('input').forEach(input => {
+                input.onchange = () => {
+                    filterState[col] = Array.from(dropdown.querySelectorAll('input:checked')).map(i=>i.value);
+                    filterTable();
+                };
+            });
+        };
+    });
+    document.body.onclick = () => {
+        document.querySelectorAll('.filter-dropdown').forEach(d => d.style.display='none');
+    };
+}
+
+function fetchAndRenderData() {
+    fetch(apiUrl)
+    .then(r => r.json())
+    .then(json => {
+        data = json;
+        filteredData = data;
+        createTableRows(data);
+        if (!map) {
+            map = L.map('map', { zoomControl: true }).setView([40.8, 30.5], 8);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+                attribution: '© OpenStreetMap'
+            }).addTo(map);
+        }
+        updateMarkers(data);
+        addTableEvents();
+        setupTableHeaderEvents();
+    });
+}
+
+document.getElementById('refresh-data').onclick = fetchAndRenderData;
+
+// Auto-refresh every 6 hours
+setInterval(fetchAndRenderData, 21600000);
+
+fetchAndRenderData();
+
+document.getElementById('search').addEventListener('input', filterTable);
+</script>
+</html>
